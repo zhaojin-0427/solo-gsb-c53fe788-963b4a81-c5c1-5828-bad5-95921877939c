@@ -776,6 +776,108 @@ def test_self_join_sum_counterfactual_zero_padding_not_widened(client):
     assert r2.headers["x-idempotent-replay"] == "true"
 
 
+def test_self_join_sum_shared_left_label_no_false_422(client):
+    """Regression for the POST /query self-join sum false-positive 422.
+
+    Row 1 self-joins rows 2..22 (only left=row-1 pairs are kept); rows 2..20
+    hold non-zero amounts summing to 0 (ten +9, nine -10), rows 21/22 are 0.
+    After projecting the right id and amount, the 19 non-zero members share
+    ledger[1] in every witness, so the active pool is exactly 20 labels —
+    ledger[1..20]. The two zero members (1,21) and (1,22) also depend on
+    ledger[1]: any active mask containing ledger[1] kills them too, so no
+    superset of the minimal cover {ledger[1]} can ever qualify. The
+    selective gate must prune those 2**19 masks by witness dependency
+    instead of exhausting the 200k mask budget and falling back to the
+    22-label full pool (which wrongly answered 422). The exact search then
+    returns the 20 singleton deletion sets; deleting row 1 empties the
+    aggregate input (EMPTY_AGGREGATE).
+    """
+    rows = [{"id": 1, "k": 1, "amount": 0}]
+    rows += [{"id": i, "k": 1, "amount": 9} for i in range(2, 12)]
+    rows += [{"id": i, "k": 1, "amount": -10} for i in range(12, 21)]
+    rows += [{"id": i, "k": 1, "amount": 0} for i in (21, 22)]
+    req = {
+        "idempotency_key": "key-selfjoin-shared-left-0",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["id"],
+                "columns": [
+                    {"name": "id", "type": "int"},
+                    {"name": "k", "type": "int"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {
+                "type": "project",
+                "columns": [
+                    {"from": "right.id", "as": "rid"},
+                    {"from": "right.amount", "as": "amt"},
+                ],
+                "input": {
+                    "type": "filter",
+                    "predicate": {
+                        "and": [
+                            {"column": "id", "op": "=", "value": 1},
+                            {"column": "right.id", "op": ">=", "value": 2},
+                        ]
+                    },
+                    "input": {
+                        "type": "join",
+                        "left": {"type": "scan", "table": "ledger"},
+                        "right": {"type": "scan", "table": "ledger"},
+                        "on": [{"left": "k", "right": "k"}],
+                    },
+                },
+            },
+            "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+        },
+        "explain": {"row": {"total": 0}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    target = body["result"]["rows"][0]
+    assert target["row"] == {"total": 0}
+    # Witnesses: the single minimal non-zero combination covering all 19
+    # non-zero members (labels ledger[1..20]), plus each zero member alone.
+    assert target["provenance"]["labels_structured"] == [
+        [f"ledger[{i}]" for i in range(1, 21)],
+        ["ledger[1]", "ledger[21]"],
+        ["ledger[1]", "ledger[22]"],
+    ]
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_count"] == 20
+    # The 20 singleton minimal deletion sets, in label order.
+    assert cf["minimal_deletion_sets"] == [
+        [f"ledger[{i}]"] for i in range(1, 21)
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    # Deleting row 1 removes every member: scalar aggregate input is empty.
+    only_row1 = by_delete[("ledger[1]",)]
+    assert only_row1["target_present"] is False
+    assert only_row1["recompute_error"]["code"] == "EMPTY_AGGREGATE"
+    assert "result" not in only_row1
+    # Deleting a +9 row moves the total to -9; deleting a -10 row to +10.
+    for i in range(2, 12):
+        sc = by_delete[(f"ledger[{i}]",)]
+        assert sc["target_present"] is False
+        assert sc["result"]["rows"] == [{"total": -9}]
+    for i in range(12, 21):
+        sc = by_delete[(f"ledger[{i}]",)]
+        assert sc["target_present"] is False
+        assert sc["result"]["rows"] == [{"total": 10}]
+    # Idempotent replay stays byte-identical.
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 200
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
 def test_self_join_sum_zero_target_zero_pairs_still_422(client):
     """The selective gate must not become over-aggressive: when the target is
     total=0 the 18 independent zero self-pairs genuinely sustain the target

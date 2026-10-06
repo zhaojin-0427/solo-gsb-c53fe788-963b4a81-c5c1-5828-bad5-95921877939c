@@ -506,6 +506,160 @@ def test_mixed_sign_sum_pool_self_join_selective_gate_keeps_zero_pair():
     assert pool.active_member_count == 2
 
 
+def test_mixed_sign_sum_pool_shared_left_prunes_dependent_inert():
+    """Self-join where every member shares the left source row: 19 non-zero
+    members (ten +9, nine -10) plus two zero members, all with row 1 in
+    their witnesses. The active pool is exactly 20 labels; the selective
+    gate must prune the 2**19 supersets of the cover {ledger[1]} by witness
+    dependency (any mask containing ledger[1] also kills both zero members,
+    so no inert survivor can reproduce total=0) instead of overflowing the
+    mask budget and widening to the 22-label full pool. The zero labels
+    ledger[21]/ledger[22] stay reduced out: no minimal deletion set
+    contains them (deleting row 1 alone already empties the group)."""
+    rows = [{"id": 1, "k": 1, "amount": 0}]
+    rows += [{"id": i, "k": 1, "amount": 9} for i in range(2, 12)]
+    rows += [{"id": i, "k": 1, "amount": -10} for i in range(12, 21)]
+    rows += [{"id": i, "k": 1, "amount": 0} for i in (21, 22)]
+    tables = [
+        {
+            "table": "ledger",
+            "primary_key": ["id"],
+            "columns": ["id", "k", "amount"],
+            "rows": rows,
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {
+            "type": "project",
+            "columns": [
+                {"from": "right.id", "as": "rid"},
+                {"from": "right.amount", "as": "amt"},
+            ],
+            "input": {
+                "type": "filter",
+                "predicate": {
+                    "and": [
+                        {"column": "id", "op": "=", "value": 1},
+                        {"column": "right.id", "op": ">=", "value": 2},
+                    ]
+                },
+                "input": {
+                    "type": "join",
+                    "left": {"type": "scan", "table": "ledger"},
+                    "right": {"type": "scan", "table": "ledger"},
+                    "on": [{"left": "k", "right": "k"}],
+                },
+            },
+        },
+        "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (0,))
+    assert pool is not None
+    assert pool.group_member_count == 21
+    assert pool.active_member_count == 19
+    assert pool.full == {L("ledger", i) for i in range(1, 23)}
+    assert pool.active_labels == {L("ledger", i) for i in range(1, 21)}
+    # The gate examined only the two minimal covers and one superset before
+    # pruning ({1}, {2..20}, {1..20}) — far below the 200k mask budget.
+    assert pool.gate_candidates == 3
+    # The zero labels are proven irrelevant: the pool stays the 20 active
+    # labels and fits the enumeration cap exactly.
+    assert pool.reduced == {L("ledger", i) for i in range(1, 21)}
+    assert pool.dropped_inert_count == 2
+
+
+def test_mixed_sign_sum_pool_fast_path_proves_inert_irrelevant():
+    """When no non-empty subset of the inert members can reproduce the
+    target (here: zero-valued members vs target total 7), the selective
+    gate returns the active pool without examining a single mask."""
+    rows = [
+        {"id": 1, "k": 1, "amount": 0},
+        {"id": 2, "k": 1, "amount": 5},
+        {"id": 3, "k": 1, "amount": -5},
+        {"id": 4, "k": 2, "amount": 7},
+    ]
+    rows += [{"id": i, "k": i, "amount": 0} for i in range(5, 23)]
+    predicate = {"or": [
+        {
+            "and": [
+                {"column": "id", "op": "=", "value": 1},
+                {"column": "right.id", "op": ">=", "value": 2},
+            ]
+        },
+        {"column": "id", "op": "=", "value": 4},
+    ]}
+    predicate["or"] += [
+        {"column": "id", "op": "=", "value": i} for i in range(5, 23)
+    ]
+    tables = [
+        {
+            "table": "ledger",
+            "primary_key": ["id"],
+            "columns": ["id", "k", "amount"],
+            "rows": rows,
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {
+            "type": "project",
+            "columns": [{"from": "right.amount", "as": "amt"}],
+            "input": {
+                "type": "filter",
+                "predicate": predicate,
+                "input": {
+                    "type": "join",
+                    "left": {"type": "scan", "table": "ledger"},
+                    "right": {"type": "scan", "table": "ledger"},
+                    "on": [{"left": "k", "right": "k"}],
+                },
+            },
+        },
+        "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (7,))
+    assert pool is not None
+    assert pool.reduced == {L("ledger", i) for i in range(1, 5)}
+    assert pool.gate_candidates == 0
+    assert pool.dropped_inert_count == 18
+
+
+def test_aggregate_sum_minimal_combos_value_compression():
+    """Repeated values: minimality is decided per value multiset, then
+    expanded to row combinations (equal-valued rows stay distinct)."""
+    from app.evaluator import minimal_sum_combos
+
+    # 2p = 3q only at p=3, q=2: the unique non-zero minimal combination is
+    # all five rows; each zero row is a singleton combination of its own.
+    items = [
+        ({"id": "a"}, 2),
+        ({"id": "b"}, 2),
+        ({"id": "c"}, 2),
+        ({"id": "d"}, -3),
+        ({"id": "e"}, -3),
+        ({"id": "f"}, 0),
+        ({"id": "g"}, 0),
+    ]
+    combos = minimal_sum_combos(items, 0)
+    assert {tuple(m["id"] for m in c) for c in combos} == {
+        ("a", "b", "c", "d", "e"),
+        ("f",),
+        ("g",),
+    }
+    # Equal positive values expand to every choice of rows: target 4 with
+    # three 2-rows gives C(3,2) = 3 minimal combinations.
+    items = [({"id": ch}, 2) for ch in "abc"]
+    combos = minimal_sum_combos(items, 4)
+    assert {tuple(m["id"] for m in c) for c in combos} == {
+        ("a", "b"),
+        ("a", "c"),
+        ("b", "c"),
+    }
+
+
 def test_empty_aggregate_input():
     from app.errors import ApiError
 

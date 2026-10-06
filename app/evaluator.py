@@ -22,6 +22,7 @@ unioned and pruned to inclusion-minimal witnesses. A label is a
 """
 from __future__ import annotations
 
+import itertools
 from collections import defaultdict
 from typing import Any, Iterable
 
@@ -257,26 +258,82 @@ def minimal_sum_combos(
     target is 0 — with mixed positive/negative values the empty set would
     otherwise "witness" the total and collapse the sum component to the
     trivial family, making the provenance (and the deletion sets derived
-    from it) wrong. Once a partial selection already sums to the target no
-    superset of it can be minimal, and with all values non-negative a
-    partial sum above the target can never come back down; both observations
-    prune the backtracking.
+    from it) wrong.
+
+    The enumeration works on take-counts per DISTINCT value instead of per
+    row. A row-level combination is minimal iff its value multiset is
+    minimal: a proper sub-multiset summing to the target would be realised
+    by a proper row subset, and every proper row subset realises a proper
+    sub-multiset. So the backtracking is exponential in the number of
+    distinct values (not in the row count — a group of 21 members holding
+    the three values 9, -10, 0 stays cheap), and each minimal take-vector
+    then expands into its row-level combinations, which are all minimal.
+    Once a partial selection already sums to the target no superset of it
+    can be minimal, and with all values non-negative a partial sum above
+    the target can never come back down; both observations prune the
+    backtracking.
     """
-    n = len(items)
-    non_negative = all(is_number(v) and v >= 0 for _, v in items)
-    combos: list[tuple[dict, ...]] = []
-    # Explicit-stack backtracking over include/exclude decisions; each state
-    # is (next index, accumulated sum, chosen indices).
+    # Group item indices by value, preserving first-appearance order.
+    group_pos: dict[Any, int] = {}
+    values: list[Any] = []
+    members: list[list[int]] = []
+    for idx, (_, v) in enumerate(items):
+        pos = group_pos.get(v)
+        if pos is None:
+            group_pos[v] = len(values)
+            values.append(v)
+            members.append([idx])
+        else:
+            members[pos].append(idx)
+    d = len(values)
+    non_negative = all(is_number(v) and v >= 0 for v in values)
+    take_vectors: list[tuple[int, ...]] = []
+    # Explicit-stack backtracking over per-value take-counts; each state is
+    # (next group index, accumulated sum, take-counts chosen so far).
     stack: list[tuple[int, Any, tuple[int, ...]]] = [(0, 0, ())]
     while stack:
-        i, acc, chosen = stack.pop()
-        if acc == target and chosen:
-            combos.append(tuple(items[j][0] for j in chosen))
+        i, acc, takes = stack.pop()
+        if acc == target and any(takes):
+            # Pad the unprocessed groups with zero takes so every recorded
+            # vector has full length d for the minimality filter below.
+            take_vectors.append(takes + (0,) * (d - i))
             continue
-        if i == n or (non_negative and acc > target):
+        if i == d or (non_negative and acc > target):
             continue
-        stack.append((i + 1, acc, chosen))
-        stack.append((i + 1, acc + items[i][1], chosen + (i,)))
+        v = values[i]
+        limit = len(members[i])
+        if v == 0:
+            # Two or more copies of a zero value are never minimal: the
+            # single-copy sub-multiset already has the same sum.
+            limit = min(limit, 1)
+        acc_c = acc
+        for c in range(limit + 1):
+            if c:
+                # Repeated addition (not c * v) keeps float accumulation
+                # order close to the per-row enumeration.
+                acc_c += v
+            stack.append((i + 1, acc_c, takes + (c,)))
+    # Keep only componentwise-minimal take-vectors: a vector strictly
+    # dominating another target-summing vector realises row combinations
+    # that properly contain another combination, so they are not minimal.
+    minimal_vectors = [
+        t
+        for t in take_vectors
+        if not any(
+            u != t and all(uc <= tc for uc, tc in zip(u, t))
+            for u in take_vectors
+        )
+    ]
+    combos: list[tuple[dict, ...]] = []
+    for takes in minimal_vectors:
+        choices = [
+            itertools.combinations(members[g], c)
+            for g, c in enumerate(takes)
+            if c
+        ]
+        for picked in itertools.product(*choices):
+            row_indices = sorted(j for part in picked for j in part)
+            combos.append(tuple(items[j][0] for j in row_indices))
     return combos
 
 
@@ -897,11 +954,44 @@ class Evaluator:
         survives a label deletion iff one of its witnesses is disjoint from
         the deleted labels, and aggregate values are simulated over the
         survivors. This is exact for scan/filter/project/join inputs and
-        needs no whole-plan recomputation. Returns ``(widened pool, masks
-        examined)``.
+        needs no whole-plan recomputation.
+
+        Two witness-dependency cuts keep the mask enumeration tractable
+        without ever changing the outcome:
+
+        * **Irrelevance fast path** — when no non-empty subset of ALL inert
+          members can reproduce the target row, condition 2 can never hold,
+          so every inert-only label is provably irrelevant and the pool
+          stays active-only at zero mask cost.
+        * **Survivor-reproducibility pruning** — inert survivor sets only
+          shrink as a mask grows, so once the inert members surviving some
+          mask can no longer reproduce the target (in any non-empty
+          subset), no superset of that mask can qualify either and the
+          whole DFS subtree is pruned. This is what stops a shared label
+          (e.g. the common left side of a self-join, present in every
+          member witness) from exploding the enumeration: any mask
+          containing it kills the dependent inert members too, and the
+          2**k supersets of such a mask are skipped instead of counted
+          against the mask budget.
+
+        Returns ``(widened pool, masks examined)``.
         """
         # Local import: provenance imports evaluator types at module load.
         from .provenance import minimal_hitting_sets
+
+        inert_only = full_pool - active_pool
+        if not inert_only:
+            return set(active_pool), 0
+
+        target_tuple = tuple(target_values[a] for _, _, a in aggs)
+
+        # Fast path: the inert-only labels are provably irrelevant when the
+        # inert members cannot present the target row in any non-empty
+        # subset, whatever the active mask deletes.
+        if not self._inert_target_achievable(
+            aggs, in_names, target_tuple, inert_members
+        ):
+            return set(active_pool), 0
 
         active_labels = sorted(active_pool, key=lambda lab: (lab[0], lab[1]))
         index = {lab: i for i, lab in enumerate(active_labels)}
@@ -956,14 +1046,13 @@ class Evaluator:
                     out.append(max(vals) if vals else None)
             return tuple(out)
 
-        target_tuple = tuple(target_values[a] for _, _, a in aggs)
-
         # Enumerate active masks that kill every active member. Every such
         # mask is a superset of at least one minimal hitting set of the
         # active witness edges, so for each minimal cover enumerate its
-        # supersets by DFS (each mask is processed at most once), with a hard
-        # bound on processed masks: beyond it the gate conservatively widens
-        # to the full member-label pool.
+        # supersets by DFS (each mask is processed at most once), pruning
+        # subtrees whose inert survivors can no longer reproduce the target,
+        # with a hard bound on processed masks: beyond it the gate
+        # conservatively widens to the full member-label pool.
         edge_label_sets: set[Witness] = set()
         for es in active_edges:
             for e in es:
@@ -974,23 +1063,34 @@ class Evaluator:
         examined = 0
         overflow = False
         qualifying: set[int] = set()
-        processed: set[int] = set()
+        processed: dict[int, bool] = {}
 
         def examine(mask: int) -> bool:
+            """Record *mask*; return True when the DFS must not grow beyond
+            it (pruned subtree or budget overflow)."""
             nonlocal examined, overflow
-            if mask in processed:
-                return overflow
-            processed.add(mask)
+            cached = processed.get(mask)
+            if cached is not None:
+                return cached
             examined += 1
             if examined > self._GATE_CANDIDATE_LIMIT:
                 overflow = True
-                return overflow
-            if kills_all_active(mask):
-                # Conditions 1 and 2.
-                inert_survivors = survivor_rows(inert_edges, mask)
-                if inert_survivors and agg_values(inert_survivors) == target_tuple:
-                    qualifying.add(mask)
-            return overflow
+                processed[mask] = True
+                return True
+            survivors = survivor_rows(inert_edges, mask)
+            # Survivor sets only shrink as the mask grows: when no non-empty
+            # subset of the current survivors can reproduce the target row,
+            # no superset of this mask can qualify — prune the subtree.
+            if not self._inert_target_achievable(
+                aggs, in_names, target_tuple, survivors
+            ):
+                processed[mask] = True
+                return True
+            # Conditions 1 and 2.
+            if kills_all_active(mask) and agg_values(survivors) == target_tuple:
+                qualifying.add(mask)
+            processed[mask] = False
+            return False
 
         # Deterministic order of minimal covers for stable diagnostics.
         minimal_covers = sorted(
@@ -1022,8 +1122,7 @@ class Evaluator:
             # the full member-label pool (still subject to the cap upstream).
             return set(full_pool), examined
 
-        inert_only = full_pool - active_pool
-        if not inert_only or not qualifying:
+        if not qualifying:
             return set(active_pool), examined
 
         widened: set[Label] = set(active_pool)
@@ -1079,6 +1178,62 @@ class Evaluator:
                 if label_can_hit_minimally(z, frozenset(required_edges)):
                     widened.add(z)
         return widened, examined
+
+    @staticmethod
+    def _inert_target_achievable(
+        aggs: list[tuple[str, str | None, str]],
+        in_names: list[str],
+        target_tuple: tuple,
+        survivors: list[dict],
+    ) -> bool:
+        """Whether some NON-EMPTY subset of *survivors* (all inert members)
+        can still take every target aggregate value.
+
+        Inert members carry zero/NULL values (sum, count(col)), non-extremal
+        values (min/max), or count(*) padding, so the values a subset can
+        produce are tightly limited and checked exactly per aggregate:
+
+        * ``count(*)``: any size 1..|survivors|;
+        * ``count(col)``: always 0 (inert members are NULL in ``col``);
+        * ``sum(col)``: 0 when a zero-valued member is kept, NULL when only
+          NULL members are kept — never a non-zero number;
+        * ``min``/``max(col)``: any non-NULL inert value (a singleton
+          subset), or NULL from an all-NULL subset.
+
+        This is a sound pruning criterion for the mask DFS: inert survivor
+        sets only shrink as the deletion mask grows, so if no non-empty
+        subset of the current survivors can reproduce the target row, no
+        superset of the current mask can satisfy the gate's condition 2.
+        """
+        if not survivors:
+            return False
+        n = len(survivors)
+        for k, (fn, col, _) in enumerate(aggs):
+            target = target_tuple[k]
+            if fn == "count":
+                if col is None or col == "*":
+                    if not (1 <= target <= n):
+                        return False
+                elif target != 0:
+                    return False
+                continue
+            ci = in_names.index(col)
+            vals = [r["data"][ci] for r in survivors]
+            non_null = [v for v in vals if v is not None]
+            any_null = len(non_null) != len(vals)
+            if fn == "sum":
+                if target is None:
+                    if not any_null:
+                        return False
+                elif target != 0 or not any(v == 0 for v in non_null):
+                    return False
+            else:  # min / max
+                if target is None:
+                    if not any_null:
+                        return False
+                elif target not in non_null:
+                    return False
+        return True
 
     @staticmethod
     def _target_reproducible(

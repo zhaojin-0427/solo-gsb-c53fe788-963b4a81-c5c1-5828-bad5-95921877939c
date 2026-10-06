@@ -516,7 +516,14 @@ curl -s -X POST http://localhost:8000/query \
   补位零成员（如下例目标 `total=7` 时的 18 条零自连接对）一律留在池外，
   而零目标自连接例子里撑住 `total=0` 的 `ledger[4]` 会被精确放回（双标签
   方案不会漏报）。该结构性枚举本身设有 200 000 个子问题上限，极端输入下
-  超限才保守放宽回全量池。
+  超限才保守放宽回全量池。为守住这个上限，枚举带两道**不改变结果**的
+  见证依赖剪枝：其一，若全部惰性成员的任意非空子集都复现不了目标行
+  （例如目标 `total≠0` 而惰性成员全是零值），条件②永远不可能成立，
+  惰性标签被直接证明无关，0 次掩码检查返回活跃池；其二，掩码增长时
+  惰性存活集只缩不增，一旦当前存活成员的任意非空子集都复现不了目标行，
+  整棵超集子树被剪除——共享标签（如自连接的公共左侧行）会把依赖它的
+  零值成员一起删掉，含该标签的 2^k 个超集掩码因此被整体跳过，不再
+  白白消耗 20 万掩码额度（见下文"共享左侧标签的自连接求和"例）。
 * **精确枚举（不利用失败剪枝）**：按删除集大小递增枚举；**只有已找到
   解的超集才跳过**（超集必不极小），某个删除集没让目标消失，绝不据此
   跳过它的超集 —— 混合正负求和下，多删一行可能正好把总和改离目标值。
@@ -643,13 +650,14 @@ curl -s -X POST http://localhost:8000/query \
  "details":{"active_member_count":21,"dependency_gate_recomputes":0,"dropped_inert_label_count":0,
             "full_pool_size":21,"group_member_count":21,
             "pool_limit":20,"reduced_pool_size":21,
-            "selective_gate_candidates":1}}
+            "selective_gate_candidates":0}}}
 ```
 
 其中 `selective_gate_candidates` 是选择性惰性标签门检查过的活跃标签子集数；
 `dropped_inert_label_count` 是经门裁决后仍留在池外的惰性标签数；
 `dependency_gate_recomputes` 为历史字段，恒为 `0`（新门纯结构性，不做
-整计划重算）。
+整计划重算）。上例 21 个成员全部活跃，候选池在进门前就超过上限，因此
+`selective_gate_candidates` 为 `0`。
 
 ### 连接求和的反事实：自连接零值成员不能按金额丢弃
 
@@ -899,6 +907,402 @@ curl -s -X POST http://localhost:8000/query \
 清空全部成员的多标签删除集），18 + 4 > 20，服务仍会诚实地返回结构化
 422 而不是漏掉多标签方案或给出近似答案。
 
+#### 反例修复：共享左侧标签的自连接求和误报 422（`total=0`，22 行）
+
+上节的零成员各自独立（见证是单标签）；本例反过来——**所有成员共享同一个
+左侧来源行**。`ledger` 22 行的连接键都是 `k=1`：行 1（金额 0）作为左侧
+与行 2–22 配对（过滤只保留 `id = 1 AND right.id >= 2`）；行 2–11 金额
+`+9`（十行），行 12–20 金额 `-10`（九行），行 21、22 金额 `0`，投影右侧
+行号与金额后求和，目标 `total = 10×9 − 9×10 = 0`。
+
+* 19 条非零成员的见证都含 `ledger[1]`，汇成 **20 个活跃标签**
+  `ledger[1..20]`；两条零值成员 `(1,21)`、`(1,22)` 的见证
+  `{ledger[1], ledger[21]}`、`{ledger[1], ledger[22]}` 也依赖行 1。
+* 删行 1：全部 21 条成员的见证都被命中，聚合输入为空
+  （`EMPTY_AGGREGATE`），目标消失 —— `{ledger[1]}` 是极小删除集；
+* 删行 j（2–20）：只移除成员 `(1,j)`，总和变 `-9` 或 `+10`，目标消失
+  —— 19 个单标签极小删除集；
+* 删行 21 或 22：只删一条零值成员，总和仍是 `0`，目标存活；任何含
+  21/22 的更大删除集要么杀不死目标、要么真包含某个单标签解（不极小）。
+  所以 **21、22 不属于任何极小删除集**，正确答案就是 20 个单标签集合。
+
+旧门控在这里误报 422：活跃见证边的极小覆盖是 `{ledger[1]}` 与
+`{ledger[2..20]}`，对 `{ledger[1]}` 做超集枚举要展开 2^19 个掩码——但
+任何含 `ledger[1]` 的掩码连两条零值成员也一起杀掉（它们的见证含行 1），
+惰性存活集为空、永远复现不了 `total=0`，这 50 余万次检查全是无用功；
+掩码额度（20 万）耗尽后门控保守退回 22 标签全池，超过 20 标签上限而
+错误返回 422。新的**存活可复现剪枝**在检查 `{ledger[1]}` 时发现零值
+成员无一存活、目标已不可能由惰性成员复现，整棵子树立即剪除；再检查
+`{ledger[2..20]}`（零值成员存活且合计 0，但删掉其中任一活跃标签都会
+复活一条非零成员、使 `A` 可省去，条件④不成立），全程只检查 **3 个
+掩码**。惰性标签 21、22 被证明无关而留在池外，候选池 = 20 个活跃标签，
+精确枚举在 21 次重算内返回 20 个单标签方案（预算 20 万掩码 / 1 万次
+重算均未触及）。
+
+请求体较长，完整内容见
+[`examples/selfjoin_total_0_shared_left.json`](examples/selfjoin_total_0_shared_left.json)，
+一键复现：
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/selfjoin_total_0_shared_left.json
+```
+
+实际响应（线上为单行紧凑 JSON；这里格式化）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [
+    {"source": "ledger[1]", "symbol": "s1"},
+    {"source": "ledger[10]", "symbol": "s10"},
+    {"source": "ledger[11]", "symbol": "s11"},
+    {"source": "ledger[12]", "symbol": "s12"},
+    {"source": "ledger[13]", "symbol": "s13"},
+    {"source": "ledger[14]", "symbol": "s14"},
+    {"source": "ledger[15]", "symbol": "s15"},
+    {"source": "ledger[16]", "symbol": "s16"},
+    {"source": "ledger[17]", "symbol": "s17"},
+    {"source": "ledger[18]", "symbol": "s18"},
+    {"source": "ledger[19]", "symbol": "s19"},
+    {"source": "ledger[2]", "symbol": "s2"},
+    {"source": "ledger[20]", "symbol": "s20"},
+    {"source": "ledger[21]", "symbol": "s21"},
+    {"source": "ledger[22]", "symbol": "s22"},
+    {"source": "ledger[3]", "symbol": "s3"},
+    {"source": "ledger[4]", "symbol": "s4"},
+    {"source": "ledger[5]", "symbol": "s5"},
+    {"source": "ledger[6]", "symbol": "s6"},
+    {"source": "ledger[7]", "symbol": "s7"},
+    {"source": "ledger[8]", "symbol": "s8"},
+    {"source": "ledger[9]", "symbol": "s9"}
+  ],
+  "result": {
+    "columns": ["total"],
+    "row_count": 1,
+    "rows": [
+      {
+        "minimal_witnesses": [
+          {
+            "conjunction": "s1 ∧ s2 ∧ s3 ∧ s4 ∧ s5 ∧ s6 ∧ s7 ∧ s8 ∧ s9 ∧ s10 ∧ s11 ∧ s12 ∧ s13 ∧ s14 ∧ s15 ∧ s16 ∧ s17 ∧ s18 ∧ s19 ∧ s20",
+            "labels": [
+              "ledger[1]",
+              "ledger[2]",
+              "ledger[3]",
+              "ledger[4]",
+              "ledger[5]",
+              "ledger[6]",
+              "ledger[7]",
+              "ledger[8]",
+              "ledger[9]",
+              "ledger[10]",
+              "ledger[11]",
+              "ledger[12]",
+              "ledger[13]",
+              "ledger[14]",
+              "ledger[15]",
+              "ledger[16]",
+              "ledger[17]",
+              "ledger[18]",
+              "ledger[19]",
+              "ledger[20]"
+            ],
+            "symbols": [
+              "s1",
+              "s2",
+              "s3",
+              "s4",
+              "s5",
+              "s6",
+              "s7",
+              "s8",
+              "s9",
+              "s10",
+              "s11",
+              "s12",
+              "s13",
+              "s14",
+              "s15",
+              "s16",
+              "s17",
+              "s18",
+              "s19",
+              "s20"
+            ]
+          },
+          {
+            "conjunction": "s1 ∧ s21",
+            "labels": ["ledger[1]", "ledger[21]"],
+            "symbols": ["s1", "s21"]
+          },
+          {
+            "conjunction": "s1 ∧ s22",
+            "labels": ["ledger[1]", "ledger[22]"],
+            "symbols": ["s1", "s22"]
+          }
+        ],
+        "provenance": {
+          "dnf": "(s1 ∧ s2 ∧ s3 ∧ s4 ∧ s5 ∧ s6 ∧ s7 ∧ s8 ∧ s9 ∧ s10 ∧ s11 ∧ s12 ∧ s13 ∧ s14 ∧ s15 ∧ s16 ∧ s17 ∧ s18 ∧ s19 ∧ s20) ∨ (s1 ∧ s21) ∨ (s1 ∧ s22)",
+          "dnf_structured": [
+            [
+              "s1",
+              "s2",
+              "s3",
+              "s4",
+              "s5",
+              "s6",
+              "s7",
+              "s8",
+              "s9",
+              "s10",
+              "s11",
+              "s12",
+              "s13",
+              "s14",
+              "s15",
+              "s16",
+              "s17",
+              "s18",
+              "s19",
+              "s20"
+            ],
+            ["s1", "s21"],
+            ["s1", "s22"]
+          ],
+          "labels_structured": [
+            [
+              "ledger[1]",
+              "ledger[2]",
+              "ledger[3]",
+              "ledger[4]",
+              "ledger[5]",
+              "ledger[6]",
+              "ledger[7]",
+              "ledger[8]",
+              "ledger[9]",
+              "ledger[10]",
+              "ledger[11]",
+              "ledger[12]",
+              "ledger[13]",
+              "ledger[14]",
+              "ledger[15]",
+              "ledger[16]",
+              "ledger[17]",
+              "ledger[18]",
+              "ledger[19]",
+              "ledger[20]"
+            ],
+            ["ledger[1]", "ledger[21]"],
+            ["ledger[1]", "ledger[22]"]
+          ]
+        },
+        "row": {"total": 0},
+        "witness_count": 3
+      }
+    ]
+  },
+  "counterfactual": {
+    "minimal_deletion_count": 20,
+    "minimal_deletion_sets": [
+      ["ledger[1]"],
+      ["ledger[2]"],
+      ["ledger[3]"],
+      ["ledger[4]"],
+      ["ledger[5]"],
+      ["ledger[6]"],
+      ["ledger[7]"],
+      ["ledger[8]"],
+      ["ledger[9]"],
+      ["ledger[10]"],
+      ["ledger[11]"],
+      ["ledger[12]"],
+      ["ledger[13]"],
+      ["ledger[14]"],
+      ["ledger[15]"],
+      ["ledger[16]"],
+      ["ledger[17]"],
+      ["ledger[18]"],
+      ["ledger[19]"],
+      ["ledger[20]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["ledger[1]"],
+        "recompute_error": {
+          "code": "EMPTY_AGGREGATE",
+          "message": "aggregate input is empty: no groups can be formed"
+        },
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[2]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[3]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[4]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[5]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[6]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[7]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[8]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[9]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[10]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[11]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": -9}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[12]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[13]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[14]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[15]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[16]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[17]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[18]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[19]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      },
+      {
+        "delete": ["ledger[20]"],
+        "result": {"columns": ["total"], "row_count": 1, "rows": [{"total": 10}]},
+        "target_present": false
+      }
+    ],
+    "target": {"total": 0},
+    "target_index": 0,
+    "target_provenance": {
+      "dnf": "(s1 ∧ s2 ∧ s3 ∧ s4 ∧ s5 ∧ s6 ∧ s7 ∧ s8 ∧ s9 ∧ s10 ∧ s11 ∧ s12 ∧ s13 ∧ s14 ∧ s15 ∧ s16 ∧ s17 ∧ s18 ∧ s19 ∧ s20) ∨ (s1 ∧ s21) ∨ (s1 ∧ s22)",
+      "dnf_structured": [
+        [
+          "s1",
+          "s2",
+          "s3",
+          "s4",
+          "s5",
+          "s6",
+          "s7",
+          "s8",
+          "s9",
+          "s10",
+          "s11",
+          "s12",
+          "s13",
+          "s14",
+          "s15",
+          "s16",
+          "s17",
+          "s18",
+          "s19",
+          "s20"
+        ],
+        ["s1", "s21"],
+        ["s1", "s22"]
+      ],
+      "labels_structured": [
+        [
+          "ledger[1]",
+          "ledger[2]",
+          "ledger[3]",
+          "ledger[4]",
+          "ledger[5]",
+          "ledger[6]",
+          "ledger[7]",
+          "ledger[8]",
+          "ledger[9]",
+          "ledger[10]",
+          "ledger[11]",
+          "ledger[12]",
+          "ledger[13]",
+          "ledger[14]",
+          "ledger[15]",
+          "ledger[16]",
+          "ledger[17]",
+          "ledger[18]",
+          "ledger[19]",
+          "ledger[20]"
+        ],
+        ["ledger[1]", "ledger[21]"],
+        ["ledger[1]", "ledger[22]"]
+      ]
+    }
+  }
+}
+```
+
+解读：`total=0` 有三条极小见证 —— 19 条非零成员全体构成的组合（标签
+`ledger[1..20]`，十个 `+9` 与九个 `-10` 缺一不可）与两条零值成员各自的
+单成员组合。最小删除集是按标签序返回的 20 个单标签集合
+`["ledger[1]"]` … `["ledger[20]"]`：删行 1 清空整组，场景保留结构化的
+`recompute_error: EMPTY_AGGREGATE`；删行 2–11 总和变 `-9`，删行 12–20
+总和变 `+10`，20 个场景重算后目标均消失。零值标签 `ledger[21]`、
+`ledger[22]` 被门控证明与任何极小删除集无关，不进候选池；但若它们
+**独立**存活（不依赖行 1），删行 1 后正是它们把 `0` 撑住，门控照样会
+把它们精确放回（见前面 `ledger[4]` 的双标签方案与 18 条独立零对的诚实
+422）——剪枝只跳过“无论如何都复现不了目标”的子树，不改变裁决结果。
+
 ### 幂等重放逐字节一致
 
 ```bash
@@ -958,7 +1362,12 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
   可喂给多条成员（如行 1 同时产出 `+5` 与 `-5` 两条连接成员），零值自连接
   成员可能正是零目标存活的原因，其标签会被精确放回；而维持不了目标行的
   独立补位零成员（如目标 `total=7` 时的 18 条零自连接对）不会被“一刀切”
-  扩入候选池。随后对候选删除集按大小递增枚举，**按删除后重算的完整目标行**
+  扩入候选池。门的掩码枚举设 200 000 个子问题上限，并带两道不改变结果的
+  见证依赖剪枝：惰性成员的任意非空子集都复现不了目标行时直接证明惰性
+  标签无关（0 次掩码检查）；掩码增长时惰性存活集只缩不增，存活成员一旦
+  复现不了目标行，整棵超集子树被剪除（共享左侧标签的自连接因此不会
+  耗尽掩码额度）。随后对候选删除集按大小递增枚举，**按删除后重算的完整
+  目标行**
   判定，返回全部按包含关系极小的方案；枚举中只有已找到解的超集才被跳过，
   未命中的删除集不剪枝其超集。候选池（约简 + 选择性门后）超过 20 行、或
   整计划重算超过 10 000 次时返回结构化错误
