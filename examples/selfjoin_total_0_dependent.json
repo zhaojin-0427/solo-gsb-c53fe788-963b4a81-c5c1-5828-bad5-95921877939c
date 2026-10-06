@@ -1,0 +1,62 @@
+{
+  "idempotency_key": "selfjoin-total-0-dependent-zero-pairs",
+  "tables": [
+    {
+      "table": "ledger",
+      "primary_key": ["id"],
+      "columns": [
+        {"name": "id", "type": "int"},
+        {"name": "k", "type": "int"},
+        {"name": "amount", "type": "int"}
+      ],
+      "rows": [
+        {"id": 1, "k": 1, "amount": 0},
+        {"id": 2, "k": 1, "amount": 1},
+        {"id": 3, "k": 1, "amount": 2},
+        {"id": 4, "k": 1, "amount": 3},
+        {"id": 5, "k": 1, "amount": 4},
+        {"id": 6, "k": 1, "amount": 5},
+        {"id": 7, "k": 1, "amount": 6},
+        {"id": 8, "k": 1, "amount": 7},
+        {"id": 9, "k": 1, "amount": 8},
+        {"id": 10, "k": 1, "amount": 9},
+        {"id": 11, "k": 1, "amount": 10},
+        {"id": 12, "k": 1, "amount": 11},
+        {"id": 13, "k": 1, "amount": 12},
+        {"id": 14, "k": 1, "amount": 13},
+        {"id": 15, "k": 1, "amount": 14},
+        {"id": 16, "k": 1, "amount": 15},
+        {"id": 17, "k": 1, "amount": 16},
+        {"id": 18, "k": 1, "amount": 17},
+        {"id": 19, "k": 1, "amount": 18},
+        {"id": 20, "k": 1, "amount": -171},
+        {"id": 21, "k": 1, "amount": 0},
+        {"id": 22, "k": 1, "amount": 0}
+      ]
+    }
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {
+      "type": "project",
+      "columns": [{"from": "right.amount", "as": "amt"}],
+      "input": {
+        "type": "filter",
+        "predicate": {
+          "and": [
+            {"column": "id", "op": "=", "value": 1},
+            {"column": "right.id", "op": ">=", "value": 2}
+          ]
+        },
+        "input": {
+          "type": "join",
+          "left": {"type": "scan", "table": "ledger"},
+          "right": {"type": "scan", "table": "ledger"},
+          "on": [{"left": "k", "right": "k"}]
+        }
+      }
+    },
+    "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}]
+  },
+  "explain": {"row": {"total": 0}}
+}

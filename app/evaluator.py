@@ -881,17 +881,20 @@ class Evaluator:
         2. the **inert members surviving ``A`` alone still reproduce the full
            target row** — otherwise the target is already gone after ``A``
            and again no inert label is needed;
-        3. every surviving inert member has an ``A``-disjoint witness
-           containing an inert-only label (some subset ``Z`` has to be able
-           to kill them all);
+        3. every surviving inert member has, for each witness keeping it
+           alive under ``A``, a non-empty ``A``-disjoint inert-only part
+           (some subset ``Z`` has to be able to hit every surviving
+           witness); the witness may additionally carry active labels not
+           selected in ``A`` — that witness is killed as soon as its
+           inert-only part is hit;
         4. ``A`` is essential in at least one of its active labels: dropping
            that label must leave a group (resurrected active members plus the
            inert members then surviving) that *can still take the target
            values* — otherwise ``A`` itself is redundant for the emptiness
            kill and no minimal set has this active part; and
         5. *z* lies in some inclusion-minimal hitting set of the surviving
-           inert members' inert-only witness edges (it must be able to carry
-           its share of the kill without a dominating smaller edge).
+           inert witnesses' inert-only edges (it must be able to carry its
+           share of the kill without a dominating smaller edge).
 
         Conditions 1–4 are evaluated purely structurally: a labeled member
         survives a label deletion iff one of its witnesses is disjoint from
@@ -915,82 +918,130 @@ class Evaluator:
                     m |= 1 << j
             return m
 
-        active_edges = [
-            frozenset(mask_of_witness(w) for w in m["witnesses"])
+        # Precompute per-member active witness masks and, for inert members,
+        # the inert-only part ``w ∩ inert_only`` of each witness. A member
+        # survives an active-label deletion mask A iff one of its witnesses
+        # has no active bit in A; the A-disjoint labels of such a surviving
+        # witness are exactly its inert-only part, which Z must be able to
+        # hit.
+        inert_only = full_pool - active_pool
+        active_wm = [
+            [mask_of_witness(w) for w in m["witnesses"]]
             for m in active_members
         ]
-        inert_edges = [
-            (m, frozenset(mask_of_witness(w) for w in m["witnesses"]))
+        inert_info = [
+            (
+                m,
+                [mask_of_witness(w) for w in m["witnesses"]],
+                [w & inert_only for w in m["witnesses"]],
+            )
             for m in inert_members
         ]
 
-        def survives(member_edges: frozenset[int], mask: int) -> bool:
-            return any((e & mask) == 0 for e in member_edges)
-
-        def survivor_rows(edges, mask):
-            return [m for m, es in edges if survives(es, mask)]
-
-        def kills_all_active(mask: int) -> bool:
-            return all(not survives(es, mask) for es in active_edges)
-
-        def agg_values(rows: list[dict]):
-            """Aggregate tuple aligned to ``aggs``; None iff input is empty."""
-            if not rows:
-                return None
-            out = []
-            for fn, col, _ in aggs:
-                if fn == "count":
-                    if col is None or col == "*":
-                        out.append(len(rows))
-                    else:
-                        ci = in_names.index(col)
-                        out.append(sum(1 for r in rows if r["data"][ci] is not None))
-                    continue
-                ci = in_names.index(col)
-                vals = [r["data"][ci] for r in rows if r["data"][ci] is not None]
-                if fn == "sum":
-                    out.append(sum(vals) if vals else None)
-                elif fn == "min":
-                    out.append(min(vals) if vals else None)
-                else:
-                    out.append(max(vals) if vals else None)
-            return tuple(out)
-
         target_tuple = tuple(target_values[a] for _, _, a in aggs)
+
+        # Fast proof of lazy-label irrelevance without examining a single
+        # mask: inert members only carry zero/NULL sum values, NULL counted
+        # values (count(col)), or non-extremal min/max values, so keeping
+        # EVERY inert member is the largest possible inert contribution
+        # (sum is constant 0, count(col) constant 0, count(*) has no inert
+        # members). If no subset of all inert members can even reproduce the
+        # target tuple, no surviving subset at any active mask ever can (e.g.
+        # zero padding under a total=7 target): every inert-only label is
+        # proven irrelevant structurally.
+        if inert_members and not self._inert_subset_can_target(
+            aggs, in_names, target_tuple, [m for m, _, _ in inert_info]
+        ):
+            return set(active_pool), 0
 
         # Enumerate active masks that kill every active member. Every such
         # mask is a superset of at least one minimal hitting set of the
         # active witness edges, so for each minimal cover enumerate its
-        # supersets by DFS (each mask is processed at most once), with a hard
-        # bound on processed masks: beyond it the gate conservatively widens
-        # to the full member-label pool.
+        # supersets by DFS (each mask is processed at most once).
+        #
+        # Let S(A) be the inert members surviving mask A. Survival is
+        # monotone: S grows as masks shrink, so once S is empty at A it is
+        # empty at every superset — that whole subtree is pruned, which is
+        # exactly the blow-up case (a one-label cover with 19 free bits when
+        # every inert member depends on that label). Likewise, when no subset
+        # of S(A) reproduces the target row no superset subset can either.
+        # After condition 3 holds (every surviving witness is hit through its
+        # inert part), further growth only shrinks the required edge family,
+        # which may make more inert labels minimal hitters, so qualifying
+        # subtrees are still explored. A hard bound on processed masks
+        # remains: beyond it the gate conservatively widens to the full
+        # member-label pool.
         edge_label_sets: set[Witness] = set()
-        for es in active_edges:
-            for e in es:
+        for wms in active_wm:
+            for e in wms:
                 edge_label_sets.add(
                     frozenset(active_labels[j] for j in range(n) if e & (1 << j))
                 )
 
         examined = 0
         overflow = False
-        qualifying: set[int] = set()
+        qualifying: list[tuple[int, set[Witness]]] = []
         processed: set[int] = set()
 
         def examine(mask: int) -> bool:
+            """Process one mask; return True when the grow subtree prunes."""
             nonlocal examined, overflow
             if mask in processed:
-                return overflow
+                return True
             processed.add(mask)
             examined += 1
             if examined > self._GATE_CANDIDATE_LIMIT:
                 overflow = True
-                return overflow
-            if kills_all_active(mask):
-                # Conditions 1 and 2.
-                inert_survivors = survivor_rows(inert_edges, mask)
-                if inert_survivors and agg_values(inert_survivors) == target_tuple:
-                    qualifying.add(mask)
-            return overflow
+                return False
+            # Condition 1: the mask must remove every active member.
+            if any(any((e & mask) == 0 for e in wms) for wms in active_wm):
+                return False
+            # All active members are gone: classify the surviving inert
+            # members and the inert-only edges Z would have to hit.
+            survivor_rows: list[dict] = []
+            required_edges: set[Witness] = set()
+            # ``stable`` says every surviving witness carries no active label
+            # outside A: such witnesses survive every superset unchanged, so
+            # once the family is stable a larger mask can neither kill nor
+            # resurrect a member nor change the required edges.
+            stable = True
+            for m, wms, parts in inert_info:
+                surv = [(e, p) for e, p in zip(wms, parts) if (e & mask) == 0]
+                if not surv:
+                    continue
+                survivor_rows.append(m)
+                # The member survives through each surviving witness. Z can
+                # hit a surviving witness through its (A-disjoint) inert-only
+                # part; a witness whose inert part is empty is active-only
+                # and cannot be killed by inert-only labels — larger masks
+                # may still remove it, so keep growing instead of pruning.
+                for e, p in surv:
+                    if not p:
+                        return False
+                    if e:
+                        stable = False
+                required_edges |= {p for _, p in surv}
+            if not survivor_rows:
+                # No inert member survives; none can be resurrected by a
+                # superset, so no inert-only label belongs to a solution.
+                return True
+            # Condition 2: the surviving inert members alone must reproduce
+            # the full target row. For sum/count(col) inert contributions are
+            # constant, but inert min/max padding is dropped as masks grow, so
+            # test subset feasibility rather than the fixed all-survivors
+            # aggregate; when no subset reaches the target the subtree prunes
+            # (further growth only removes members).
+            if not self._inert_subset_can_target(
+                aggs, in_names, target_tuple, survivor_rows
+            ):
+                return True
+            qualifying.append((mask, required_edges))
+            # Keep growing only while a surviving witness still carries an
+            # unselected active label: killing it under a larger mask shrinks
+            # the required family and may turn another inert label into a
+            # minimal hitter. When the family is stable the subtree is fully
+            # decided at this mask.
+            return stable
 
         # Deterministic order of minimal covers for stable diagnostics.
         minimal_covers = sorted(
@@ -1003,7 +1054,8 @@ class Evaluator:
                 base |= 1 << index[lab]
 
             def grow(mask: int, start: int) -> None:
-                if examine(mask) or overflow:
+                pruned = examine(mask)
+                if overflow or pruned:
                     return
                 for j in range(start, n):
                     bit = 1 << j
@@ -1022,12 +1074,11 @@ class Evaluator:
             # the full member-label pool (still subject to the cap upstream).
             return set(full_pool), examined
 
-        inert_only = full_pool - active_pool
         if not inert_only or not qualifying:
             return set(active_pool), examined
 
         widened: set[Label] = set(active_pool)
-        for mask in qualifying:
+        for mask, required_edges in qualifying:
             # Condition 4: at least one active bit must be essential. With
             # that bit dropped, the group (resurrected active members plus
             # every inert member that then survives) must be able to take the
@@ -1041,9 +1092,13 @@ class Evaluator:
                 resurrected = [
                     m
                     for k, m in enumerate(active_members)
-                    if survives(active_edges[k], reduced)
+                    if any((e & reduced) == 0 for e in active_wm[k])
                 ]
-                inert_surv = survivor_rows(inert_edges, reduced)
+                inert_surv = [
+                    m
+                    for m, wms, _ in inert_info
+                    if any((e & reduced) == 0 for e in wms)
+                ]
                 if self._target_reproducible(
                     aggs, in_names, target_tuple, resurrected, inert_surv
                 ):
@@ -1052,33 +1107,56 @@ class Evaluator:
             if not essential:
                 continue
 
-            # Condition 3: the inert members surviving A must all be killable
-            # by inert-only labels. Such a member is killed iff EVERY one of
-            # its A-disjoint witnesses is hit; if any such witness still
-            # contains an active label (shared with an active member but not
-            # selected in A), no inert-only Z can remove the member and this
-            # active part cannot occur in a minimal deletion set. Otherwise
-            # the flat family of those witnesses is exactly what Z must
-            # transversal-hit.
-            required_edges: set[Witness] = set()
-            ruled_out = False
-            for m in survivor_rows(inert_edges, mask):
-                disjoint = [
-                    w for w in m["witnesses"] if (mask_of_witness(w) & mask) == 0
-                ]
-                if any(not w <= inert_only for w in disjoint):
-                    ruled_out = True
-                    break
-                required_edges |= set(disjoint)
-            if ruled_out or not required_edges:
-                continue
-
             # Condition 5: restore the inert-only labels that occur in some
-            # inclusion-minimal hitting set of the required edges.
+            # inclusion-minimal hitting set of the survivors' inert edges.
             for z in inert_only:
                 if label_can_hit_minimally(z, frozenset(required_edges)):
                     widened.add(z)
         return widened, examined
+
+    @staticmethod
+    def _inert_subset_can_target(
+        aggs: list[tuple[str, str | None, str]],
+        in_names: list[str],
+        target_tuple: tuple,
+        inert_rows: list[dict],
+    ) -> bool:
+        """Whether *some* subset of the given inert members reproduces every
+        target aggregate value.
+
+        Inert members contribute 0 to ``sum`` (NULL/zero values), 0 to
+        ``count(col)`` (NULL values), 1 to ``count(*)`` (which has no inert
+        members in practice), and arbitrary but non-target-extremal values to
+        ``min``/``max``. The target extremum can therefore only come from an
+        active member; without one, no subset of inert members reproduces a
+        min/max target.
+        """
+        if not inert_rows:
+            return False
+        for k, (fn, col, _) in enumerate(aggs):
+            target = target_tuple[k]
+            if fn == "count":
+                if col is None or col == "*":
+                    if not (0 <= target <= len(inert_rows)):
+                        return False
+                else:
+                    ci = in_names.index(col)
+                    n_nonnull = sum(
+                        1 for r in inert_rows if r["data"][ci] is not None
+                    )
+                    if not (0 <= target <= n_nonnull):
+                        return False
+                continue
+            ci = in_names.index(col)
+            vals = [r["data"][ci] for r in inert_rows if r["data"][ci] is not None]
+            if fn == "sum":
+                # Inert non-NULL values are all zero.
+                got = sum(vals) if vals else None
+                if got != target:
+                    return False
+            else:  # min / max: inert values are non-extremal by construction
+                return False
+        return True
 
     @staticmethod
     def _target_reproducible(
